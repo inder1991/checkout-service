@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-service
+  namespace: buggy-checkout
+  labels:
+    app: checkout-service
+    version: v1.0.0-buggy
+    environment: production
+spec:
+  replicas: 3  # Multiple replicas to trigger race conditions
+  selector:
+    matchLabels:
+      app: checkout-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: checkout-service
+        version: v1.0.0-buggy
+        environment: production
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: checkout-service
+        image: buggy-checkout-service:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: ELASTICSEARCH_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: checkout-service-config
+              key: ELASTICSEARCH_HOST
+        - name: ELASTICSEARCH_INDEX
+          valueFrom:
+            configMapKeyRef:
+              name: checkout-service-config
+              key: ELASTICSEARCH_INDEX
+        - name: SERVICE_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: checkout-service-config
+              key: SERVICE_NAME
+        - name: ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: checkout-service-config
+              key: ENVIRONMENT
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi  # Low memory to trigger OOM faster
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 2
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
