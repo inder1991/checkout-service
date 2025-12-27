@@ -3,5 +3,5 @@ kind: Namespace
 metadata:
   name: checkout
   labels:
-    name: buggy-checkout
+    name: checkout
     environment: production
