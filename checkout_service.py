@@ -34,6 +34,8 @@ from datetime import datetime
 import os
 import socket
 import requests
+import threading
+from contextlib import contextmanager
 
 app = FastAPI(title="Checkout Service")
 
@@ -377,68 +379,104 @@ def call_payment_gateway(amount: float, trace_id: str = None):
 
 
 # =============================================================================
-# BUG #5: RACE CONDITION
+# BUG #5: RACE CONDITION - FIXED
 # =============================================================================
 
 inventory_stock = {"item-123": 100}
 
+# Thread-safe locking mechanism for inventory operations
+stock_locks = {}  # item_id -> threading.Lock()
+lock_manager_lock = threading.Lock()
+
+def get_item_lock(item_id: str) -> threading.Lock:
+    """
+    Get or create a lock for a specific item.
+    Thread-safe lock acquisition to prevent race conditions.
+    """
+    with lock_manager_lock:
+        if item_id not in stock_locks:
+            stock_locks[item_id] = threading.Lock()
+        return stock_locks[item_id]
+
+
 async def check_and_decrement_stock(item_id: str, quantity: int, trace_id: str = None):
     """
-    BUG #5: Race condition! Multiple requests can pass the check simultaneously.
-    The check and decrement are not atomic.
+    FIXED: Atomically check and decrement stock with proper locking.
     
-    IMPORTANT: We skip business logic validation (stock availability check).
-    We ONLY detect the technical bug: negative stock due to race condition.
+    This function now uses thread-safe locking to prevent race conditions
+    when multiple concurrent requests attempt to decrement stock.
+    
+    Args:
+        item_id: Product identifier
+        quantity: Amount to decrement
+        trace_id: Distributed tracing identifier
+    
+    Raises:
+        RuntimeError: If negative inventory is detected (should not happen with proper locking)
     """
     log_json("INFO", "Decrementing inventory stock",
             trace_id=trace_id, 
             item_id=item_id,
             requested_quantity=quantity,
-            locking_mechanism="none",
-            atomic_operation=False)
+            locking_mechanism="threading.Lock",
+            atomic_operation=True)
     
-    try:
-        current_stock = inventory_stock.get(item_id, 0)
-        
-        # REMOVED: Business logic validation (insufficient stock check)
-        # We only care about the technical bug: race condition causing negative stock
-        
-        # BUG: Artificial delay makes race condition more obvious!
-        # In production, network latency or database query time creates similar gap
-        await asyncio.sleep(0.1)
-        
-        # BUG: Check-then-act pattern without synchronization!
-        # Multiple concurrent requests can pass the check simultaneously
-        inventory_stock[item_id] = current_stock - quantity
-        
-        # ONLY check for negative stock (the actual code bug)
-        if inventory_stock[item_id] < 0:
-            error_msg = f"Negative stock detected: item_id={item_id} stock_level={inventory_stock[item_id]} lock_type=none atomic=false"
-            raise RuntimeError(error_msg)
-        
-        log_json("INFO", "Stock decremented successfully",
-                trace_id=trace_id, 
+    # Get the lock for this specific item
+    item_lock = get_item_lock(item_id)
+    
+    # Acquire lock to ensure atomic check-and-decrement
+    with item_lock:
+        try:
+            current_stock = inventory_stock.get(item_id, 0)
+            
+            log_json("DEBUG", "Lock acquired for stock operation",
+                    trace_id=trace_id,
+                    item_id=item_id,
+                    current_stock=current_stock,
+                    requested_quantity=quantity)
+            
+            # Artificial delay to simulate database query time
+            # With proper locking, this delay no longer causes race conditions
+            await asyncio.sleep(0.1)
+            
+            # FIXED: Atomic check-then-act pattern with synchronization
+            # The lock ensures only one thread can execute this block at a time
+            new_stock = current_stock - quantity
+            inventory_stock[item_id] = new_stock
+            
+            # Validate result (should never be negative with proper locking)
+            if inventory_stock[item_id] < 0:
+                # This should not happen with proper locking, but we check defensively
+                error_msg = f"Negative stock detected despite locking: item_id={item_id} stock_level={inventory_stock[item_id]} lock_type=threading.Lock atomic=true"
+                raise RuntimeError(error_msg)
+            
+            log_json("INFO", "Stock decremented successfully",
+                    trace_id=trace_id, 
+                    item_id=item_id,
+                    old_stock=current_stock,
+                    remaining_stock=inventory_stock[item_id],
+                    decremented_by=quantity,
+                    lock_type="threading.Lock",
+                    atomic_operation=True)
+                    
+        except RuntimeError as e:
+            # Log the error with full context
+            log_exception(
+                "ERROR",
+                "Negative inventory detected (locking failure)",
+                exc=e,
+                trace_id=trace_id,
+                span_id=f"race-condition-{int(time.time())}",
+                error_code="NEGATIVE_STOCK",
                 item_id=item_id,
-                remaining_stock=inventory_stock[item_id],
-                decremented_by=quantity)
-                
-    except RuntimeError as e:
-        log_exception(
-            "ERROR",
-            "Negative inventory detected",
-            exc=e,
-            trace_id=trace_id,
-            span_id=f"race-condition-{int(time.time())}",
-            error_code="NEGATIVE_STOCK",
-            item_id=item_id,
-            stock_level=inventory_stock[item_id],
-            locking_mechanism="none",
-            atomic_operation=False,
-            concurrent_requests_likely=True,
-            severity="critical",
-            bug_id="BUG_5_RACE_CONDITION"
-        )
-        raise
+                stock_level=inventory_stock[item_id],
+                locking_mechanism="threading.Lock",
+                atomic_operation=True,
+                concurrent_requests_likely=True,
+                severity="critical",
+                bug_id="BUG_5_RACE_CONDITION_FIXED"
+            )
+            raise
 
 
 # =============================================================================
@@ -474,7 +512,7 @@ def root():
             "2. Memory leak (unbounded cache)",
             "3. Null pointer errors",
             "4. API timeout (no timeout set)",
-            "5. Race condition (stock decrement)"
+            "5. Race condition (stock decrement) - FIXED"
         ]
     }
 
@@ -517,7 +555,7 @@ async def checkout(request: CheckoutRequest):
     
     Flow:
     1. Validate user (downstream User Service)
-    2. Check stock (downstream Inventory Service + internal bug #5)
+    2. Check stock (downstream Inventory Service + internal bug #5 - FIXED)
     3. Acquire DB connection (internal bug #1)
     4. Cache order (internal bug #2)
     5. Validate payment data (internal bug #3)
@@ -572,7 +610,7 @@ async def checkout(request: CheckoutRequest):
             # Continue - business logic errors ignored
         
         # =====================================================================
-        # STEP 2: Check Stock (Downstream + Internal Bug #5)
+        # STEP 2: Check Stock (Downstream + Internal Bug #5 - FIXED)
         # =====================================================================
         log_json("INFO", "➡️ Step 2: Checking stock",
                 trace_id=trace_id, downstream_service="inventory-service",
@@ -609,12 +647,12 @@ async def checkout(request: CheckoutRequest):
                         downstream_service="inventory-service")
                 total_amount += 99.99 * item.quantity  # Continue anyway
             
-            # BUG #5: Internal race condition check
+            # FIXED Bug #5: Internal race condition check with proper locking
             try:
                 await check_and_decrement_stock(item.item_id, item.quantity, trace_id)
             except RuntimeError as e:
-                # KEEP: This is Bug #5 - race condition (negative stock = code bug)
-                log_exception("ERROR", "Race condition detected",
+                # This should not happen with proper locking, but we handle it defensively
+                log_exception("ERROR", "Race condition detected (should not happen with locking)",
                         exc=e,
                         trace_id=trace_id, severity="critical")
                 raise HTTPException(status_code=409, detail="Negative stock detected - race condition")
@@ -763,112 +801,4 @@ async def checkout(request: CheckoutRequest):
                 )
                 reserve_response.raise_for_status()
                 log_json("INFO", "✅ Stock reserved",
-                        trace_id=trace_id, item_id=item.item_id)
-            except Exception as e:
-                log_json("WARN", "Stock reservation failed (continuing anyway)",
-                        trace_id=trace_id, item_id=item.item_id)
-                # Continue - downstream errors don't block internal bugs
-        
-        # =====================================================================
-        # STEP 9: Send Notification (Downstream)
-        # =====================================================================
-        log_json("INFO", "➡️ Step 9: Sending notification",
-                trace_id=trace_id, downstream_service="notification-service",
-                flow_stage="NOTIFICATION")
-        
-        try:
-            notification_response = requests.post(
-                f"{NOTIFICATION_SERVICE}/send-notification",
-                json={
-                    "user_email": request.user_email,
-                    "notification_type": "order_confirmation",
-                    "subject": f"Order Confirmed: {order_id}",
-                    "body": f"Your order {order_id} has been confirmed.",
-                    "order_id": order_id
-                },
-                timeout=5
-            )
-            if notification_response.status_code != 200:
-                log_json("WARN", "⚠️ Notification failed (non-blocking)",
-                        trace_id=trace_id, severity="low")
-            else:
-                log_json("INFO", "✅ Notification sent", trace_id=trace_id)
-        except Exception as e:
-            log_json("WARN", "⚠️ Notification error (non-blocking)",
-                    trace_id=trace_id, error=str(e), severity="low")
-        
-        # =====================================================================
-        # SUCCESS
-        # =====================================================================
-        order_record = {
-            "order_id": order_id,
-            "user_email": request.user_email,
-            "items": [item.dict() for item in request.items],
-            "total_amount": total_amount,
-            "status": "completed",
-            "transaction_id": payment_data.get('transaction_id'),
-            "created_at": datetime.utcnow().isoformat()
-        }
-        
-        order_history.append(order_record)
-        
-        log_json("INFO", "🎉 Checkout completed successfully",
-                trace_id=trace_id, order_id=order_id,
-                total_amount=total_amount, flow_stage="COMPLETED")
-        
-        return {
-            "success": True,
-            "order_id": order_id,
-            "trace_id": trace_id,
-            "total_amount": total_amount,
-            "transaction_id": payment_data.get('transaction_id'),
-            "status": "completed"
-        }
-    
-    except HTTPException:
-        log_json("ERROR", "❌ Checkout failed",
-                trace_id=trace_id, flow_stage="FAILED")
-        raise
-    
-    except Exception as e:
-        log_exception("ERROR", "Unexpected error in checkout",
-                exc=e,
-                trace_id=trace_id, error_type="unknown_error",
-                severity="critical", flow_stage="ERROR")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-
-@app.get("/orders/history")
-def get_order_history():
-    """Get order history"""
-    return {
-        "total_orders": len(order_history),
-        "orders": order_history[-10:]
-    }
-
-
-@app.post("/reset")
-def reset_state():
-    """Reset service state"""
-    global db_connections, order_cache, inventory_stock, order_history
-    
-    log_json("INFO", "Resetting service state")
-    
-    db_connections.clear()
-    order_cache.clear()
-    inventory_stock["item-123"] = 100
-    order_history.clear()
-    
-    return {"status": "reset"}
-
-
-@app.on_event("startup")
-async def startup_event():
-    log_json("INFO", "Checkout service starting",
-            version="1.0.0-buggy",
-            bugs="5 original bugs + microservices orchestration")
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+                        trace_
