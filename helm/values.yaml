@@ -3,7 +3,7 @@ replicaCount: 2
 image:
   repository: your-registry/checkout-service
   pullPolicy: IfNotPresent
-  tag: "2.1.0"
+  tag: "2.2.0"
 
 service:
   type: ClusterIP
@@ -17,14 +17,25 @@ env:
   CHECKOUT_TOTAL_TIMEOUT: "15"
   INVENTORY_TIMEOUT: "8"
   PAYMENT_TIMEOUT: "8"
+  # Retry configuration
+  INVENTORY_RETRY_COUNT: "3"
+  INVENTORY_RETRY_BASE_DELAY: "0.5"
+  INVENTORY_RETRY_MAX_DELAY: "4.0"
+  PAYMENT_RETRY_COUNT: "2"
+  PAYMENT_RETRY_BASE_DELAY: "0.5"
+  # Circuit breaker configuration
+  INVENTORY_CIRCUIT_BREAKER_THRESHOLD: "5"
+  INVENTORY_CIRCUIT_BREAKER_TIMEOUT: "30"
+  PAYMENT_CIRCUIT_BREAKER_THRESHOLD: "5"
+  PAYMENT_CIRCUIT_BREAKER_TIMEOUT: "30"
 
 resources:
   limits:
-    cpu: 1000m
-    memory: 1Gi
+    cpu: "1000m"
+    memory: "1Gi"
   requests:
-    cpu: 200m
-    memory: 256Mi
+    cpu: "200m"
+    memory: "256Mi"
 
 autoscaling:
   enabled: true
