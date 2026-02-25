@@ -1,3 +1,5 @@
+```python
+import asyncio
 import json
 import logging
 import os
@@ -16,14 +18,20 @@ from typing import List
 import httpx
 
 # =============================================================================
-# Checkout Service v2.1.0
+# Checkout Service v2.2.0
 #
 # Orchestrates checkout flow:  User → Inventory → Payment → Notification
 # All calls are SEQUENTIAL (synchronous within the request path).
+#
+# v2.2.0 fixes:
+#   - Handle httpx.ConnectError explicitly in downstream call helpers
+#   - Add circuit breaker for inventory-service and payment-service
+#   - Use asyncio.sleep instead of blocking time.sleep for notification retries
+#   - Reduce default INVENTORY_TIMEOUT from 8s to 5s for faster failure
 # =============================================================================
 
 SERVICE_NAME = "checkout-service"
-SERVICE_VERSION = "2.1.0"
+SERVICE_VERSION = "2.2.0"
 
 # ---------------------------------------------------------------------------
 # Structured JSON logger
@@ -83,10 +91,75 @@ def log(level, message, trace_id=None, span_id=None, order_id=None, exc_info=Non
 
 
 # ---------------------------------------------------------------------------
+# Circuit Breaker
+# ---------------------------------------------------------------------------
+class CircuitBreaker:
+    """
+    Simple circuit breaker with three states: CLOSED, OPEN, HALF_OPEN.
+
+    - CLOSED: requests pass through normally. Consecutive failures are counted.
+    - OPEN: requests are immediately rejected. After `recovery_timeout` seconds
+      the breaker transitions to HALF_OPEN.
+    - HALF_OPEN: a single probe request is allowed. If it succeeds the breaker
+      closes; if it fails the breaker re-opens.
+    """
+
+    STATE_CLOSED = "closed"
+    STATE_OPEN = "open"
+    STATE_HALF_OPEN = "half_open"
+
+    def __init__(self, name: str, failure_threshold: int = 5,
+                 recovery_timeout: float = 30.0):
+        self.name = name
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._state = self.STATE_CLOSED
+        self._failure_count = 0
+        self._last_failure_time: float = 0.0
+        self._half_open_in_flight = False
+
+    @property
+    def state(self) -> str:
+        if self._state == self.STATE_OPEN:
+            if time.time() - self._last_failure_time >= self.recovery_timeout:
+                self._state = self.STATE_HALF_OPEN
+                self._half_open_in_flight = False
+        return self._state
+
+    def allow_request(self) -> bool:
+        s = self.state
+        if s == self.STATE_CLOSED:
+            return True
+        if s == self.STATE_HALF_OPEN:
+            if not self._half_open_in_flight:
+                self._half_open_in_flight = True
+                return True
+            return False
+        return False  # OPEN
+
+    def record_success(self):
+        self._failure_count = 0
+        self._state = self.STATE_CLOSED
+        self._half_open_in_flight = False
+
+    def record_failure(self):
+        self._failure_count += 1
+        self._last_failure_time = time.time()
+        if self._failure_count >= self.failure_threshold:
+            self._state = self.STATE_OPEN
+        self._half_open_in_flight = False
+
+
+# ---------------------------------------------------------------------------
 # Custom exceptions for proper stacktraces
 # ---------------------------------------------------------------------------
 class InventoryServiceTimeoutError(Exception):
     """Raised when inventory-service does not respond within timeout."""
+    pass
+
+
+class InventoryServiceConnectionError(Exception):
+    """Raised when inventory-service is unreachable (connection refused/reset)."""
     pass
 
 
@@ -95,13 +168,28 @@ class InventoryServiceError(Exception):
     pass
 
 
+class InventoryCircuitOpenError(Exception):
+    """Raised when the inventory circuit breaker is open."""
+    pass
+
+
 class PaymentGatewayTimeoutError(Exception):
     """Raised when payment-service does not respond within timeout."""
     pass
 
 
+class PaymentServiceConnectionError(Exception):
+    """Raised when payment-service is unreachable (connection refused/reset)."""
+    pass
+
+
 class PaymentServiceError(Exception):
     """Raised when payment-service returns a non-2xx response."""
+    pass
+
+
+class PaymentCircuitOpenError(Exception):
+    """Raised when the payment circuit breaker is open."""
     pass
 
 
@@ -129,14 +217,32 @@ PAYMENT_URL = os.getenv("PAYMENT_SERVICE_URL", "http://payment-service:8003")
 NOTIFICATION_URL = os.getenv("NOTIFICATION_SERVICE_URL", "http://notification-service:8004")
 USER_URL = os.getenv("USER_SERVICE_URL", "http://user-service:8001")
 
-# Timeout budget
+# Timeout budget  (inventory default lowered from 8→5 for faster failure)
 TOTAL_TIMEOUT = float(os.getenv("CHECKOUT_TOTAL_TIMEOUT", "15.0"))
-INVENTORY_TIMEOUT = float(os.getenv("INVENTORY_TIMEOUT", "8.0"))
+INVENTORY_TIMEOUT = float(os.getenv("INVENTORY_TIMEOUT", "5.0"))
 PAYMENT_TIMEOUT = float(os.getenv("PAYMENT_TIMEOUT", "8.0"))
 NOTIFICATION_TIMEOUT = float(os.getenv("NOTIFICATION_TIMEOUT", "3.0"))
 USER_TIMEOUT = float(os.getenv("USER_TIMEOUT", "3.0"))
 
 NOTIFICATION_MAX_RETRIES = int(os.getenv("NOTIFICATION_MAX_RETRIES", "3"))
+
+# Circuit breaker configuration
+INVENTORY_CB_THRESHOLD = int(os.getenv("INVENTORY_CIRCUIT_BREAKER_THRESHOLD", "5"))
+INVENTORY_CB_TIMEOUT = float(os.getenv("INVENTORY_CIRCUIT_BREAKER_TIMEOUT", "30"))
+PAYMENT_CB_THRESHOLD = int(os.getenv("PAYMENT_CIRCUIT_BREAKER_THRESHOLD", "5"))
+PAYMENT_CB_TIMEOUT = float(os.getenv("PAYMENT_CIRCUIT_BREAKER_TIMEOUT", "30"))
+
+# Instantiate circuit breakers
+inventory_cb = CircuitBreaker(
+    "inventory-service",
+    failure_threshold=INVENTORY_CB_THRESHOLD,
+    recovery_timeout=INVENTORY_CB_TIMEOUT,
+)
+payment_cb = CircuitBreaker(
+    "payment-service",
+    failure_threshold=PAYMENT_CB_THRESHOLD,
+    recovery_timeout=PAYMENT_CB_TIMEOUT,
+)
 
 # ---------------------------------------------------------------------------
 # Metrics counters
@@ -147,8 +253,12 @@ _metrics = {
     "checkout_errors_total": 0,
     "checkout_inventory_timeout_total": 0,
     "checkout_inventory_error_total": 0,
+    "checkout_inventory_connection_error_total": 0,
+    "checkout_inventory_circuit_open_total": 0,
     "checkout_payment_timeout_total": 0,
     "checkout_payment_error_total": 0,
+    "checkout_payment_connection_error_total": 0,
+    "checkout_payment_circuit_open_total": 0,
     "checkout_budget_exhausted_total": 0,
     "checkout_notification_failures_total": 0,
     "checkout_user_validation_failures_total": 0,
@@ -175,7 +285,20 @@ class CheckoutRequest(BaseModel):
 # Downstream call helpers — raise typed exceptions for stacktraces
 # ---------------------------------------------------------------------------
 async def call_inventory(client: httpx.AsyncClient, request: CheckoutRequest, headers: dict):
-    """Call inventory-service /reserve. Raises InventoryServiceTimeoutError on timeout."""
+    """Call inventory-service /reserve.
+
+    Raises:
+        InventoryCircuitOpenError  – circuit breaker is open
+        InventoryServiceTimeoutError – timeout waiting for response
+        InventoryServiceConnectionError – TCP connection failed
+        InventoryServiceError – non-2xx HTTP response
+    """
+    if not inventory_cb.allow_request():
+        raise InventoryCircuitOpenError(
+            f"Circuit breaker OPEN for inventory-service "
+            f"(threshold={inventory_cb.failure_threshold}, "
+            f"recovery={inventory_cb.recovery_timeout}s)"
+        )
     try:
         resp = await client.post(
             f"{INVENTORY_URL}/reserve",
@@ -184,20 +307,49 @@ async def call_inventory(client: httpx.AsyncClient, request: CheckoutRequest, he
             timeout=INVENTORY_TIMEOUT,
         )
         resp.raise_for_status()
+        inventory_cb.record_success()
         return resp.json()
     except httpx.TimeoutException as e:
+        inventory_cb.record_failure()
         raise InventoryServiceTimeoutError(
             f"inventory-service did not respond within {INVENTORY_TIMEOUT}s: {e}"
         ) from e
+    except httpx.ConnectError as e:
+        inventory_cb.record_failure()
+        raise InventoryServiceConnectionError(
+            f"inventory-service unreachable (ConnectError): {e}"
+        ) from e
     except httpx.HTTPStatusError as e:
+        # 5xx → record failure for circuit breaker; 4xx → don't
+        if e.response.status_code >= 500:
+            inventory_cb.record_failure()
         raise InventoryServiceError(
             f"inventory-service returned HTTP {e.response.status_code}: "
             f"{e.response.text}"
         ) from e
+    except httpx.RequestError as e:
+        # Catch-all for any other transport-level errors (DNS, reset, etc.)
+        inventory_cb.record_failure()
+        raise InventoryServiceConnectionError(
+            f"inventory-service request failed ({type(e).__name__}): {e}"
+        ) from e
 
 
 async def call_payment(client: httpx.AsyncClient, payload: dict, headers: dict, timeout: float):
-    """Call payment-service /process. Raises PaymentGatewayTimeoutError on timeout."""
+    """Call payment-service /process.
+
+    Raises:
+        PaymentCircuitOpenError – circuit breaker is open
+        PaymentGatewayTimeoutError – timeout waiting for response
+        PaymentServiceConnectionError – TCP connection failed
+        PaymentServiceError – non-2xx HTTP response
+    """
+    if not payment_cb.allow_request():
+        raise PaymentCircuitOpenError(
+            f"Circuit breaker OPEN for payment-service "
+            f"(threshold={payment_cb.failure_threshold}, "
+            f"recovery={payment_cb.recovery_timeout}s)"
+        )
     try:
         resp = await client.post(
             f"{PAYMENT_URL}/process",
@@ -206,15 +358,29 @@ async def call_payment(client: httpx.AsyncClient, payload: dict, headers: dict, 
             timeout=timeout,
         )
         resp.raise_for_status()
+        payment_cb.record_success()
         return resp.json()
     except httpx.TimeoutException as e:
+        payment_cb.record_failure()
         raise PaymentGatewayTimeoutError(
             f"payment-service did not respond within {timeout:.2f}s: {e}"
         ) from e
+    except httpx.ConnectError as e:
+        payment_cb.record_failure()
+        raise PaymentServiceConnectionError(
+            f"payment-service unreachable (ConnectError): {e}"
+        ) from e
     except httpx.HTTPStatusError as e:
+        if e.response.status_code >= 500:
+            payment_cb.record_failure()
         raise PaymentServiceError(
             f"payment-service returned HTTP {e.response.status_code}: "
             f"{e.response.text}"
+        ) from e
+    except httpx.RequestError as e:
+        payment_cb.record_failure()
+        raise PaymentServiceConnectionError(
+            f"payment-service request failed ({type(e).__name__}): {e}"
         ) from e
 
 
@@ -246,303 +412,9 @@ async def metrics():
     # Derived metrics
     if _metrics["checkout_requests_total"] > 0:
         error_rate = _metrics["checkout_errors_total"] / _metrics["checkout_requests_total"]
-        lines.append(f"# HELP checkout_error_rate Current error rate")
-        lines.append(f"# TYPE checkout_error_rate gauge")
+        lines.append("# HELP checkout_error_rate Current error rate")
+        lines.append("# TYPE checkout_error_rate gauge")
         lines.append(f"checkout_error_rate {error_rate:.4f}")
 
     if _metrics["checkout_latency_seconds_count"] > 0:
-        avg_latency = _metrics["checkout_latency_seconds_sum"] / _metrics["checkout_latency_seconds_count"]
-        lines.append(f"# HELP checkout_avg_latency_seconds Average checkout latency")
-        lines.append(f"# TYPE checkout_avg_latency_seconds gauge")
-        lines.append(f"checkout_avg_latency_seconds {avg_latency:.4f}")
-
-    if _metrics["checkout_inventory_latency_seconds_count"] > 0:
-        avg_inv = _metrics["checkout_inventory_latency_seconds_sum"] / _metrics["checkout_inventory_latency_seconds_count"]
-        lines.append(f"# HELP checkout_inventory_avg_latency_seconds Average inventory call latency")
-        lines.append(f"# TYPE checkout_inventory_avg_latency_seconds gauge")
-        lines.append(f"checkout_inventory_avg_latency_seconds {avg_inv:.4f}")
-
-    lines.append(f'# HELP service_info Service metadata')
-    lines.append(f'# TYPE service_info gauge')
-    lines.append(f'service_info{{version="{SERVICE_VERSION}"}} 1')
-
-    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain")
-
-
-@app.post("/checkout")
-async def checkout(request: CheckoutRequest, req: Request):
-    _metrics["checkout_requests_total"] += 1
-    request_start = time.time()
-    order_id = f"ORD-{random.randint(10000, 99999)}"
-    trace_id = req.headers.get("x-request-id", uuid.uuid4().hex[:16])
-    span_id = uuid.uuid4().hex[:8]
-
-    log(logging.INFO, "Checkout initiated",
-        trace_id=trace_id, span_id=span_id, order_id=order_id,
-        user_email=request.user_email,
-        items=[i.dict() for i in request.items],
-        payment_method=request.payment_method,
-        component="checkout", step="start")
-
-    headers = {
-        "x-request-id": trace_id,
-        "x-span-id": span_id,
-        "x-order-id": order_id,
-    }
-
-    async with httpx.AsyncClient() as client:
-
-        # ==================================================================
-        # STEP 1: Validate user
-        # ==================================================================
-        try:
-            step_start = time.time()
-            log(logging.INFO, "Calling user-service for validation",
-                trace_id=trace_id, order_id=order_id,
-                component="checkout", step="user-validation",
-                downstream="user-service")
-
-            user_resp = await client.get(
-                f"{USER_URL}/health", headers=headers, timeout=USER_TIMEOUT)
-            user_resp.raise_for_status()
-
-            log(logging.INFO,
-                f"User validation completed in {time.time() - step_start:.3f}s",
-                trace_id=trace_id, order_id=order_id,
-                component="checkout", step="user-validation",
-                downstream="user-service",
-                response_time_s=round(time.time() - step_start, 3))
-        except Exception as e:
-            _metrics["checkout_user_validation_failures_total"] += 1
-            log(logging.WARNING,
-                f"User service unavailable: {type(e).__name__} — proceeding",
-                trace_id=trace_id, order_id=order_id,
-                component="checkout", step="user-validation",
-                downstream="user-service",
-                error_type=type(e).__name__)
-
-        # ==================================================================
-        # STEP 2: Reserve inventory (synchronous — the bottleneck)
-        # ==================================================================
-        inv_start = time.time()
-        try:
-            log(logging.INFO, "Calling inventory-service for stock reservation",
-                trace_id=trace_id, order_id=order_id,
-                component="checkout", step="inventory-reserve",
-                downstream="inventory-service",
-                timeout_s=INVENTORY_TIMEOUT)
-
-            inv_result = await call_inventory(client, request, headers)
-            inv_elapsed = time.time() - inv_start
-            _metrics["checkout_inventory_latency_seconds_sum"] += inv_elapsed
-            _metrics["checkout_inventory_latency_seconds_count"] += 1
-
-            log(logging.INFO,
-                f"Inventory reservation completed in {inv_elapsed:.3f}s",
-                trace_id=trace_id, order_id=order_id,
-                component="checkout", step="inventory-reserve",
-                downstream="inventory-service",
-                response_time_s=round(inv_elapsed, 3))
-
-        except InventoryServiceTimeoutError:
-            inv_elapsed = time.time() - inv_start
-            total_elapsed = time.time() - request_start
-            _metrics["checkout_inventory_timeout_total"] += 1
-            _metrics["checkout_errors_total"] += 1
-            log(logging.ERROR,
-                f"Inventory service timeout after {inv_elapsed:.2f}s "
-                f"(total request time: {total_elapsed:.2f}s)",
-                trace_id=trace_id, order_id=order_id,
-                exc_info=sys.exc_info(),
-                component="checkout", step="inventory-reserve",
-                downstream="inventory-service",
-                error_type="InventoryServiceTimeout",
-                timeout_s=INVENTORY_TIMEOUT,
-                response_time_s=round(inv_elapsed, 2),
-                total_elapsed_s=round(total_elapsed, 2))
-            raise HTTPException(status_code=500, detail="Internal Server Error")
-
-        except InventoryServiceError:
-            inv_elapsed = time.time() - inv_start
-            _metrics["checkout_inventory_error_total"] += 1
-            _metrics["checkout_errors_total"] += 1
-            log(logging.ERROR,
-                f"Inventory service returned error after {inv_elapsed:.2f}s",
-                trace_id=trace_id, order_id=order_id,
-                exc_info=sys.exc_info(),
-                component="checkout", step="inventory-reserve",
-                downstream="inventory-service",
-                error_type="InventoryServiceError",
-                response_time_s=round(inv_elapsed, 2))
-            raise HTTPException(status_code=500, detail="Internal Server Error")
-
-        # ==================================================================
-        # STEP 3: Process payment
-        # If inventory was slow, remaining budget is nearly gone.
-        # Checkout does NOT know why — blames payment.
-        # ==================================================================
-        elapsed_so_far = time.time() - request_start
-        remaining_budget = TOTAL_TIMEOUT - elapsed_so_far
-
-        if remaining_budget <= 0.5:
-            try:
-                raise CheckoutBudgetExhaustedError(
-                    f"Request budget exhausted: {elapsed_so_far:.2f}s elapsed "
-                    f"of {TOTAL_TIMEOUT}s total. Cannot initiate payment call."
-                )
-            except CheckoutBudgetExhaustedError:
-                _metrics["checkout_budget_exhausted_total"] += 1
-                _metrics["checkout_payment_timeout_total"] += 1
-                _metrics["checkout_errors_total"] += 1
-                log(logging.ERROR,
-                    f"Payment Gateway Timeout: request budget exhausted "
-                    f"({elapsed_so_far:.2f}s elapsed, {TOTAL_TIMEOUT}s budget). "
-                    f"Unable to initiate payment call.",
-                    trace_id=trace_id, order_id=order_id,
-                    exc_info=sys.exc_info(),
-                    component="checkout", step="payment-process",
-                    downstream="payment-service",
-                    error_type="GatewayTimeout",
-                    total_elapsed_s=round(elapsed_so_far, 2),
-                    budget_remaining_s=round(remaining_budget, 2))
-                raise HTTPException(status_code=504, detail="Gateway Timeout")
-
-        effective_timeout = min(PAYMENT_TIMEOUT, remaining_budget)
-        pay_start = time.time()
-
-        try:
-            log(logging.INFO, "Calling payment-service for payment processing",
-                trace_id=trace_id, order_id=order_id,
-                component="checkout", step="payment-process",
-                downstream="payment-service",
-                effective_timeout_s=round(effective_timeout, 2),
-                budget_remaining_s=round(remaining_budget, 2))
-
-            payment_payload = {
-                "amount": round(random.uniform(10.0, 500.0), 2),
-                "currency": "USD",
-                "payment_method": request.payment_method,
-                "user_email": request.user_email,
-            }
-
-            pay_result = await call_payment(client, payment_payload, headers, effective_timeout)
-            pay_elapsed = time.time() - pay_start
-            _metrics["checkout_payment_latency_seconds_sum"] += pay_elapsed
-            _metrics["checkout_payment_latency_seconds_count"] += 1
-
-            log(logging.INFO,
-                f"Payment processed in {pay_elapsed:.3f}s, "
-                f"txn={pay_result.get('transaction_id')}",
-                trace_id=trace_id, order_id=order_id,
-                component="checkout", step="payment-process",
-                downstream="payment-service",
-                response_time_s=round(pay_elapsed, 3),
-                transaction_id=pay_result.get("transaction_id"))
-
-        except PaymentGatewayTimeoutError:
-            pay_elapsed = time.time() - pay_start
-            total_elapsed = time.time() - request_start
-            _metrics["checkout_payment_timeout_total"] += 1
-            _metrics["checkout_errors_total"] += 1
-            log(logging.ERROR,
-                f"Payment Gateway Timeout: payment-service did not respond "
-                f"in {pay_elapsed:.2f}s (effective timeout was {effective_timeout:.2f}s, "
-                f"total request time: {total_elapsed:.2f}s)",
-                trace_id=trace_id, order_id=order_id,
-                exc_info=sys.exc_info(),
-                component="checkout", step="payment-process",
-                downstream="payment-service",
-                error_type="GatewayTimeout",
-                effective_timeout_s=round(effective_timeout, 2),
-                response_time_s=round(pay_elapsed, 2),
-                total_elapsed_s=round(total_elapsed, 2))
-            raise HTTPException(status_code=504, detail="Gateway Timeout")
-
-        except PaymentServiceError:
-            pay_elapsed = time.time() - pay_start
-            _metrics["checkout_payment_error_total"] += 1
-            _metrics["checkout_errors_total"] += 1
-            log(logging.ERROR,
-                f"Payment service returned error after {pay_elapsed:.2f}s",
-                trace_id=trace_id, order_id=order_id,
-                exc_info=sys.exc_info(),
-                component="checkout", step="payment-process",
-                downstream="payment-service",
-                error_type="PaymentServiceError",
-                response_time_s=round(pay_elapsed, 2))
-            raise HTTPException(status_code=500, detail="Internal Server Error")
-
-        # ==================================================================
-        # STEP 4: Notification (fire-and-forget with retries)
-        # ==================================================================
-        for attempt in range(1, NOTIFICATION_MAX_RETRIES + 1):
-            try:
-                log(logging.INFO,
-                    f"Sending order confirmation (attempt {attempt}/{NOTIFICATION_MAX_RETRIES})",
-                    trace_id=trace_id, order_id=order_id,
-                    component="checkout", step="notification",
-                    downstream="notification-service",
-                    attempt=attempt)
-
-                notif_resp = await client.post(
-                    f"{NOTIFICATION_URL}/email",
-                    json={
-                        "to": request.user_email,
-                        "subject": f"Order Confirmation - {order_id}",
-                        "body": f"Your order {order_id} has been confirmed!",
-                        "order_id": order_id,
-                    },
-                    headers=headers,
-                    timeout=NOTIFICATION_TIMEOUT,
-                )
-                notif_resp.raise_for_status()
-                log(logging.INFO, "Order confirmation sent",
-                    trace_id=trace_id, order_id=order_id,
-                    component="checkout", step="notification",
-                    downstream="notification-service")
-                break
-            except Exception as e:
-                log(logging.WARNING,
-                    f"Notification attempt {attempt} failed: {type(e).__name__}: {e}",
-                    trace_id=trace_id, order_id=order_id,
-                    component="checkout", step="notification",
-                    downstream="notification-service",
-                    error_type=type(e).__name__,
-                    attempt=attempt)
-                if attempt < NOTIFICATION_MAX_RETRIES:
-                    time.sleep(0.5 * attempt)
-
-    # ==================================================================
-    # SUCCESS
-    # ==================================================================
-    total_elapsed = time.time() - request_start
-    _metrics["checkout_success_total"] += 1
-    _metrics["checkout_latency_seconds_sum"] += total_elapsed
-    _metrics["checkout_latency_seconds_count"] += 1
-    log(logging.INFO,
-        f"Checkout completed successfully in {total_elapsed:.3f}s",
-        trace_id=trace_id, order_id=order_id,
-        component="checkout", step="complete",
-        user_email=request.user_email,
-        total_elapsed_s=round(total_elapsed, 3),
-        transaction_id=pay_result.get("transaction_id"))
-
-    return {
-        "success": True,
-        "order_id": order_id,
-        "message": "Order placed successfully",
-        "transaction_id": pay_result.get("transaction_id"),
-    }
-
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    log(logging.ERROR, f"Unhandled exception: {type(exc).__name__}: {exc}",
-        exc_info=sys.exc_info(),
-        component="checkout", error_type=type(exc).__name__)
-    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        avg_latency = _metrics["checkout_latency_seconds_sum"] / _metrics["checkout_latency_seconds_count

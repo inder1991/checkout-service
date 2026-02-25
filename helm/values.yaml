@@ -3,7 +3,7 @@ replicaCount: 2
 image:
   repository: your-registry/checkout-service
   pullPolicy: IfNotPresent
-  tag: "2.1.0"
+  tag: "2.2.0"
 
 service:
   type: ClusterIP
@@ -15,16 +15,23 @@ env:
   NOTIFICATION_SERVICE_URL: "http://notification-service:8004"
   USER_SERVICE_URL: "http://user-service:8001"
   CHECKOUT_TOTAL_TIMEOUT: "15"
-  INVENTORY_TIMEOUT: "8"
+  INVENTORY_TIMEOUT: "5"
   PAYMENT_TIMEOUT: "8"
+  NOTIFICATION_TIMEOUT: "3"
+  USER_TIMEOUT: "3"
+  NOTIFICATION_MAX_RETRIES: "3"
+  INVENTORY_CIRCUIT_BREAKER_THRESHOLD: "5"
+  INVENTORY_CIRCUIT_BREAKER_TIMEOUT: "30"
+  PAYMENT_CIRCUIT_BREAKER_THRESHOLD: "5"
+  PAYMENT_CIRCUIT_BREAKER_TIMEOUT: "30"
 
 resources:
   limits:
-    cpu: 1000m
-    memory: 1Gi
+    cpu: "1000m"
+    memory: "1Gi"
   requests:
-    cpu: 200m
-    memory: 256Mi
+    cpu: "200m"
+    memory: "256Mi"
 
 autoscaling:
   enabled: true
