@@ -3,7 +3,7 @@ replicaCount: 2
 image:
   repository: your-registry/checkout-service
   pullPolicy: IfNotPresent
-  tag: "2.1.0"
+  tag: "2.1.1"
 
 service:
   type: ClusterIP
@@ -14,16 +14,21 @@ env:
   PAYMENT_SERVICE_URL: "http://payment-service:8003"
   NOTIFICATION_SERVICE_URL: "http://notification-service:8004"
   USER_SERVICE_URL: "http://user-service:8001"
-  CHECKOUT_TOTAL_TIMEOUT: "15"
-  INVENTORY_TIMEOUT: "8"
+  CHECKOUT_TOTAL_TIMEOUT: "20"
+  INVENTORY_TIMEOUT: "12"
+  INVENTORY_MAX_RETRIES: "3"
+  INVENTORY_RETRY_DELAY: "0.5"
   PAYMENT_TIMEOUT: "8"
+  NOTIFICATION_TIMEOUT: "3"
+  NOTIFICATION_MAX_RETRIES: "3"
+  USER_TIMEOUT: "3"
 
 resources:
   limits:
-    cpu: 1000m
+    cpu: "1000m"
     memory: 1Gi
   requests:
-    cpu: 200m
+    cpu: "200m"
     memory: 256Mi
 
 autoscaling:
@@ -31,3 +36,37 @@ autoscaling:
   minReplicas: 2
   maxReplicas: 10
   targetCPUUtilizationPercentage: 70
+
+# Redis configuration for inventory service
+redis:
+  enabled: true
+  auth:
+    enabled: true
+    password: "secure-redis-password"
+  master:
+    persistence:
+      enabled: true
+      size: 8Gi
+    resources:
+      limits:
+        memory: 2Gi
+        cpu: "1000m"
+      requests:
+        memory: 1Gi
+        cpu: "500m"
+  replica:
+    replicaCount: 2
+    persistence:
+      enabled: true
+      size: 8Gi
+    resources:
+      limits:
+        memory: 2Gi
+        cpu: "1000m"
+      requests:
+        memory: 1Gi
+        cpu: "500m"
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
