@@ -1,33 +1,64 @@
-replicaCount: 2
+replicaCount = 2
 
-image:
-  repository: your-registry/checkout-service
-  pullPolicy: IfNotPresent
-  tag: "2.1.0"
+image = {
+    "repository": "your-registry/checkout-service",
+    "pullPolicy": "IfNotPresent",
+    "tag": "2.1.0"
+}
 
-service:
-  type: ClusterIP
-  port: 8000
+service = {
+    "type": "ClusterIP",
+    "port": 8000
+}
 
-env:
-  INVENTORY_SERVICE_URL: "http://inventory-service:8002"
-  PAYMENT_SERVICE_URL: "http://payment-service:8003"
-  NOTIFICATION_SERVICE_URL: "http://notification-service:8004"
-  USER_SERVICE_URL: "http://user-service:8001"
-  CHECKOUT_TOTAL_TIMEOUT: "15"
-  INVENTORY_TIMEOUT: "8"
-  PAYMENT_TIMEOUT: "8"
+env = {
+    "INVENTORY_SERVICE_URL": "http://inventory-service:8002",
+    "PAYMENT_SERVICE_URL": "http://payment-service:8003",
+    "NOTIFICATION_SERVICE_URL": "http://notification-service:8004",
+    "USER_SERVICE_URL": "http://user-service:8001",
+    "CHECKOUT_TOTAL_TIMEOUT": "15",
+    "INVENTORY_TIMEOUT": "3",
+    "PAYMENT_TIMEOUT": "8"
+}
 
-resources:
-  limits:
-    cpu: 1000m
-    memory: 1Gi
-  requests:
-    cpu: 200m
-    memory: 256Mi
+resources = {
+    "limits": {
+        "cpu": "1000m",
+        "memory": "1Gi"
+    },
+    "requests": {
+        "cpu": "200m",
+        "memory": "256Mi"
+    }
+}
 
-autoscaling:
-  enabled: true
-  minReplicas: 2
-  maxReplicas: 10
-  targetCPUUtilizationPercentage: 70
+autoscaling = {
+    "enabled": True,
+    "minReplicas": 2,
+    "maxReplicas": 10,
+    "targetCPUUtilizationPercentage": 70
+}
+
+# Readiness probe configuration to check downstream dependencies
+readinessProbe = {
+    "httpGet": {
+        "path": "/ready",
+        "port": 8000
+    },
+    "initialDelaySeconds": 10,
+    "periodSeconds": 10,
+    "timeoutSeconds": 5,
+    "failureThreshold": 3
+}
+
+# Liveness probe configuration
+livenessProbe = {
+    "httpGet": {
+        "path": "/health",
+        "port": 8000
+    },
+    "initialDelaySeconds": 30,
+    "periodSeconds": 30,
+    "timeoutSeconds": 5,
+    "failureThreshold": 3
+}
